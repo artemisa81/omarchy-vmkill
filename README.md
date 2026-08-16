@@ -112,13 +112,41 @@ With no state file at all — first run, a wiped config, a new machine — the
 answer is **blocked**. A killswitch whose failure mode is "open" is not a
 killswitch.
 
-## Known gap
+## Wiring it into your launcher
 
-Rules live in the container namespace, so they vanish when the container is
-recreated, which `windows-vm-launch` does on every launch. The widget closes
-that window by reconciling on every poll, but there is a gap between the
-container starting and the first tick. To close it properly, call
-`vmkill enforce` right after `docker-compose up` in your launcher.
+Rules live in the container's network namespace, so they vanish whenever the
+container is recreated -- which `docker-compose up` does on every launch. The
+widget reconciles on every poll and will refill them on its own, but that
+leaves a window between the container starting and the first tick, and Windows
+starts talking the instant it has a link. Close it by calling `vmkill enforce`
+straight after `docker-compose up -d`:
+
+```bash
+docker-compose -f "$COMPOSE_FILE" up -d
+vmkill enforce >/dev/null 2>&1 || echo "vmkill enforce failed - VM is NOT filtered"
+```
+
+`enforce` is idempotent (it will not reset your drop counters) and needs no
+shell running, so this also covers launching a VM with the bar down.
+
+## Pin your Docker subnets
+
+Worth doing once, independently of this plugin. Left alone, Docker allocates
+compose bridges out of `172.17.0.0/16`-`172.31.0.0/16`, and IVPN hands its
+WireGuard tunnel an address inside `172.16.0.0/12`. Those can land on top of
+each other -- a host route for the bridge that covers the tunnel's own address.
+Pin something clear of it in your compose file:
+
+```yaml
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 192.168.244.0/24
+          gateway: 192.168.244.1
+```
+
+Pick a range that misses your LAN, your homelab and your tailnet as well.
 
 ## Interactions
 
