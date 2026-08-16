@@ -69,6 +69,89 @@ IPv6 is dropped for the guest unconditionally. There is no global v6 on this
 bridge today, so nothing is lost — but if Docker or the host ever gains it, the
 v4 rules would silently stop being the whole story.
 
+## Known interaction with IVPN
+
+If you run **Isolate from LAN off** and the VMs still cannot reach your NAS,
+this is why, and it is not the plugin.
+
+IVPN's killswitch does not only filter the host's own traffic — it filters
+forwarded traffic too, and it only ever accepts the tunnel:
+
+```
+Chain FORWARD
+1  IVPN-FORWARD          <-- ahead of DOCKER-USER
+3  DOCKER-USER
+
+-A IVPN-FORWARD -j IVPN-FORWARD-VPN
+-A IVPN-FORWARD -j DROP
+
+-A IVPN-FORWARD-VPN -i tun0 -j ACCEPT
+-A IVPN-FORWARD-VPN -o tun0 -j ACCEPT
+```
+
+A VM reaching your LAN is by definition not tunnel-bound, so it dies at that
+`DROP` — before any rule this plugin installs is consulted. The container-side
+`VMLAN` chain is working correctly; the packets never get that far.
+
+**`ivpn firewall -exceptions` does not fix it.** That option only populates
+`IVPN-IN-STAT-USER-EXP` and `IVPN-OUT-STAT-USER-EXP`, which are INPUT and
+OUTPUT. It never touches FORWARD. The exception list will look correct while
+the traffic keeps being dropped.
+
+The fix is a chain ahead of IVPN's, permitting the VM subnets to LAN
+destinations only:
+
+```
+iptables -N VM-LAN-ALLOW
+iptables -A VM-LAN-ALLOW -s <vm-subnet> -d 192.168.0.0/16 -j ACCEPT
+iptables -A VM-LAN-ALLOW -s 192.168.0.0/16 -d <vm-subnet> \
+  -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -I FORWARD 1 -j VM-LAN-ALLOW
+```
+
+Scope it to LAN and tailnet **destinations** only. Those are not routable on
+the internet, so it cannot become an egress path — and whether the VMs may use
+it stays governed by the Isolate from LAN toggle, enforced in the container
+ahead of all of this.
+
+It needs re-asserting on a timer: IVPN re-inserts `IVPN-FORWARD` at FORWARD
+position 1 on every reconnect, pushing yours down.
+
+### If your LAN is reached over Tailscale
+
+Two further traps, both on IVPN's WireGuard only:
+
+IVPN installs `not from all fwmark 0xca6c lookup 51820` at a priority *above*
+Tailscale's, so LAN traffic is pulled into the tunnel and the subnet route is
+never consulted. Do not fight it with a fixed priority — IVPN re-inserts itself
+above whatever exists (observed moving between 5199 and 5209 across
+reconnects). Use its own escape hatch instead: mark tailnet-bound packets
+`0xca6c` and IVPN's rule passes them over, wherever it sits.
+
+```
+iptables -t mangle -A OUTPUT     -d <tailnet-subnet> -j MARK --set-xmark 0xca6c
+iptables -t mangle -A PREROUTING -d <tailnet-subnet> -j MARK --set-xmark 0xca6c
+```
+
+Mark **only** LAN/tailnet destinations. Marking general traffic routes it
+around the VPN.
+
+Then host-originated traffic still fails while forwarded VM traffic works,
+because a local socket picks its source address in the first route lookup —
+before the mark applies — and leaves via `tailscale0` still wearing the VPN's
+address. Forwarded traffic escapes this because Tailscale masquerades it.
+
+```
+iptables -t nat -A POSTROUTING -o tailscale0 ! -s 100.64.0.0/10 -j MASQUERADE
+```
+
+To confirm this is what you are hitting:
+
+```
+ping <nas>                    # fails
+ping -I <tailscale-ip> <nas>  # works
+```
+
 ## Requirements
 
 - Omarchy with the Quickshell plugin system.
