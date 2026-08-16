@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "id": "artemisa81.vmkill",
+  "name": "VM Killswitch",
+  "version": "1.0.0",
+  "author": "artemisa81",
+  "license": "MIT",
+  "description": "Cut internet access to dockur/windows VMs from the Omarchy bar, and hold them offline unless the IVPN tunnel is up and sealed.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "VM Killswitch",
+    "description": "Block or allow the Windows VMs' internet, with a fail-closed require-VPN policy and LAN isolation.",
+    "category": "Network",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 8,
+      "notify": true,
+      "showDropped": true
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "description": "How often the widget reconciles the rules and re-reads state. Each tick costs one `ivpn status` and one `docker exec` per running VM, so short intervals are not free.",
+        "min": 3,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 8
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify on state change",
+        "description": "Send a desktop notification whenever the VMs are cut off or let back on. Worth leaving on: the require-VPN policy can re-block on its own, and a silent change is one you will not go looking for.",
+        "defaultValue": true
+      },
+      {
+        "key": "showDropped",
+        "type": "boolean",
+        "label": "Show dropped-packet counts",
+        "description": "Display how many packets each VM's block has eaten. Live evidence the rule is actually loaded rather than merely configured.",
+        "defaultValue": true
+      }
+    ]
+  }
+}

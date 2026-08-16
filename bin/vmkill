@@ -1,0 +1,472 @@
+#!/bin/bash
+
+# vmkill -- cut internet access for dockur/windows VMs, from the host side.
+#
+# Usage: vmkill [on|off|toggle|enforce|vpn on|off|lan on|off|status [--plain]]
+#
+# The VM's packets are filtered inside the *container's* network namespace, in
+# a dedicated VMKILL chain jumped to from the top of FORWARD. Two properties
+# follow from that, and both are the point of the tool:
+#
+#   1. No sudo. The container already carries CAP_NET_ADMIN (dockur needs it to
+#      build the tap bridge), and membership of the `docker` group is enough to
+#      reach it. Filtering on the host instead would mean ufw/iptables as root.
+#
+#   2. Windows cannot see or undo it. The rules live in a namespace the guest
+#      has no handle on, so privilege escalation inside Windows -- the thing
+#      that defeats simplewall, TinyWall or Portmaster -- does not reach them.
+#
+# The rule that makes RDP survive a full cut is the --ctdir REPLY line: the
+# guest may only emit packets belonging to connections opened from *outside*.
+# So the RDP session you are watching the VM through keeps working, while every
+# guest-initiated connection dies at once -- including ones already in flight,
+# which is why no conntrack flush is needed.
+#
+# Traffic to the container itself (dnsmasq on 172.30.0.1, the /shared SMB
+# mount) is delivered locally and never traverses FORWARD, so it is unaffected
+# by design: the shared folder keeps working while the VM is cut off. Guest DNS
+# also still resolves, since dnsmasq queries upstream as the container, not as
+# the guest. That is a name-lookup channel carrying no payload; if you want it
+# closed too, block the container's own egress at the host with ufw.
+#
+# Rules live in the container namespace, so they vanish when the container is
+# recreated -- which windows-vm-launch does on every launch. `enforce` exists
+# to close that window: it re-applies the remembered state to whatever is
+# running now, and the bar widget calls it on every poll.
+#
+# REQUIRE-VPN POLICY
+#
+# With `vmkill vpn on`, a running VM reaches the internet only while the IVPN
+# tunnel is up *and* the IVPN firewall is enabled. Anything less holds the VM
+# blocked. The check is fail-closed on purpose: the VM is held until IVPN
+# reports both, rather than opened first and corrected afterwards. Opening
+# first would leak the VM's real address for as long as the tunnel takes to
+# come up -- and a Windows guest starts talking the moment it has a route.
+#
+# Order matters, and it is not cosmetic. IVPN's firewall blocks *all* traffic
+# outside the tunnel, so arming it while disconnected takes the host off the
+# network too. So: connect first, and only arm the firewall once the status
+# actually reads CONNECTED.
+#
+# Because the host masquerades the container's traffic, the VM follows the
+# host's default route, so a host-side IVPN tunnel already carries the VM. This
+# policy does not route anything; it only refuses to let the VM out until that
+# tunnel is up and sealed.
+#
+# vmkill only ever *connects* IVPN and *enables* its firewall. It never
+# disconnects and never disarms -- stopping a VM leaves your tunnel as it was.
+
+set -o pipefail
+
+CHAIN="VMKILL"
+IMAGE="dockurr/windows"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_FILE="$CONFIG_DIR/omarchy/vmkill-state"
+VPN_POLICY_FILE="$CONFIG_DIR/omarchy/vmkill-requirevpn"
+LAN_POLICY_FILE="$CONFIG_DIR/omarchy/vmkill-lan"
+ATTEMPT_DIR="$CONFIG_DIR/omarchy"
+
+# Chains, all in the container's namespace:
+#   VMKILL     - the toggleable internet cut, on FORWARD
+#   VMKILLDNS  - closes the guest's DNS side channel while cut, on OUTPUT
+#   VMLAN      - always-on isolation from your LAN / tailnet, on FORWARD
+DNS_CHAIN="VMKILLDNS"
+LAN_CHAIN="VMLAN"
+
+# Ranges the guest is never allowed to originate connections to. Your homelab
+# (192.168.8.0/24), the tailnet (100.64/10) and the host bridge itself all sit
+# in here. Link-local covers cloud-metadata style probes.
+PRIVATE_RANGES="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16"
+
+# Don't re-issue an ivpn command on every poll while the last one is settling.
+RETRY_SECONDS=25
+
+# The guest-facing bridge inside the container. dockur names it "docker",
+# which is confusingly not the host's docker0 -- it is the tap bridge the
+# QEMU guest sits behind.
+GUEST_IF="docker"
+
+die() {
+  echo "vmkill: $*" >&2
+  exit 1
+}
+
+command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+
+# ---------------------------------------------------------------- state ----
+
+# Default-deny. With no state file at all -- first run, a wiped config, a new
+# machine -- the answer is "blocked". A killswitch whose failure mode is "open"
+# is not a killswitch, and the one moment you cannot afford an open VM is the
+# moment before anyone has configured anything.
+desired_state() {
+  local v
+  [[ -r $STATE_FILE ]] && v=$(<"$STATE_FILE")
+  [[ $v == "allowed" ]] && echo allowed || echo blocked
+}
+
+set_desired_state() {
+  mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null
+  printf '%s\n' "$1" >"$STATE_FILE"
+}
+
+require_vpn() {
+  local v
+  [[ -r $VPN_POLICY_FILE ]] && v=$(<"$VPN_POLICY_FILE")
+  [[ $v == "on" ]] && echo on || echo off
+}
+
+set_require_vpn() {
+  mkdir -p "$(dirname "$VPN_POLICY_FILE")" 2>/dev/null
+  printf '%s\n' "$1" >"$VPN_POLICY_FILE"
+}
+
+# LAN isolation defaults to on, and is deliberately independent of the internet
+# toggle: "the VM may browse the web" and "the VM may reach my Proxmox box" are
+# different permissions and should not share a switch.
+lan_policy() {
+  local v
+  [[ -r $LAN_POLICY_FILE ]] && v=$(<"$LAN_POLICY_FILE")
+  [[ $v == "off" ]] && echo off || echo on
+}
+
+set_lan_policy() {
+  mkdir -p "$(dirname "$LAN_POLICY_FILE")" 2>/dev/null
+  printf '%s\n' "$1" >"$LAN_POLICY_FILE"
+}
+
+# ------------------------------------------------------------------ vpn ----
+
+# One `ivpn status` call answers both questions the policy asks. Echoes
+# "<vpnstate> <firewallstate>". A missing binary or dead daemon reports
+# UNAVAILABLE, which the policy treats as "not satisfied" and so keeps the VM
+# blocked -- an unreadable VPN is not evidence of a working one.
+vpn_probe() {
+  command -v ivpn >/dev/null 2>&1 || { echo "UNAVAILABLE UNKNOWN"; return; }
+  local out state fw
+  out=$(timeout 5 ivpn status 2>/dev/null) || true
+  [[ -z $out ]] && { echo "UNAVAILABLE UNKNOWN"; return; }
+  state=$(awk -F: '/^VPN[[:space:]]*:/      { gsub(/[[:space:]]/, "", $2); print toupper($2); exit }' <<<"$out")
+  fw=$(awk -F:    '/^Firewall[[:space:]]*:/ { gsub(/[[:space:]]/, "", $2); print toupper($2); exit }' <<<"$out")
+  echo "${state:-UNKNOWN} ${fw:-UNKNOWN}"
+}
+
+# Fire an ivpn command at most once per RETRY_SECONDS. Detached, because the
+# widget polls on a timer and must not block for a tunnel handshake.
+throttled_ivpn() {
+  local tag=$1; shift
+  local stamp="$ATTEMPT_DIR/vmkill-$tag-attempt"
+  local now last=0
+  now=$(date +%s)
+  [[ -r $stamp ]] && last=$(<"$stamp")
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  ((now - last < RETRY_SECONDS)) && return 0
+
+  mkdir -p "$ATTEMPT_DIR" 2>/dev/null
+  printf '%s\n' "$now" >"$stamp"
+  setsid "$@" >/dev/null 2>&1 &
+  return 0
+}
+
+# ------------------------------------------------------------ discovery ----
+
+# Containers running right now off the dockur image. This is the set we can
+# actually act on -- a stopped VM has no namespace to put rules in.
+running_containers() {
+  docker ps --filter "ancestor=$IMAGE" --format '{{.Names}}' 2>/dev/null
+}
+
+# Container names declared in ~/.config/*/docker-compose.yml. Used only so the
+# panel can list a VM that is currently down instead of silently omitting it.
+known_containers() {
+  local f
+  for f in "$CONFIG_DIR"/*/docker-compose.yml; do
+    [[ -f $f ]] || continue
+    grep -q "$IMAGE" "$f" || continue
+    sed -n 's/.*container_name: *//p' "$f" | head -1
+  done
+}
+
+all_containers() {
+  { running_containers; known_containers; } | sed '/^$/d' | sort -u
+}
+
+# ------------------------------------------------------------- plumbing ----
+
+# One exec per container: the chain listing answers "is it blocked" and "how
+# many packets has it eaten" at the same time. Called on every widget poll, so
+# it is worth not spending two round trips on it.
+chain_listing() {
+  docker exec "$1" sh -c "iptables -vnxL $CHAIN 2>/dev/null" 2>/dev/null
+}
+
+apply_block() {
+  docker exec "$1" sh -c "
+    iptables -N $CHAIN 2>/dev/null
+    iptables -C FORWARD -j $CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $CHAIN
+    # Already armed? Leave it be. \`enforce\` runs on every widget poll, and
+    # rebuilding the chain each time would reset the drop counter to zero.
+    if ! iptables -C $CHAIN -i $GUEST_IF ! -o $GUEST_IF -j DROP 2>/dev/null; then
+      iptables -F $CHAIN
+      iptables -A $CHAIN -i $GUEST_IF ! -o $GUEST_IF -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+      iptables -A $CHAIN -i $GUEST_IF ! -o $GUEST_IF -j DROP
+    fi
+
+    # Close the DNS side channel. The guest resolves through dnsmasq on the
+    # container, and dnsmasq queries upstream as *itself* -- container-local
+    # OUTPUT traffic that never crosses FORWARD, so the cut above does not
+    # touch it. Left alone, a cut VM can still spell data out one hostname at
+    # a time, and still tells the upstream resolver every site it visits.
+    iptables -N $DNS_CHAIN 2>/dev/null
+    iptables -C OUTPUT -j $DNS_CHAIN 2>/dev/null || iptables -I OUTPUT 1 -j $DNS_CHAIN
+    if ! iptables -C $DNS_CHAIN -o eth0 -p udp --dport 53 -j DROP 2>/dev/null; then
+      iptables -F $DNS_CHAIN
+      iptables -A $DNS_CHAIN -o eth0 -p udp --dport 53 -j DROP
+      iptables -A $DNS_CHAIN -o eth0 -p tcp --dport 53 -j DROP
+    fi
+  " >/dev/null 2>&1
+}
+
+# Flushing leaves the empty chains and their jumps in place. An empty chain
+# matches nothing, so this fully restores access while keeping the next block
+# a single flush-and-refill away.
+clear_block() {
+  docker exec "$1" sh -c "
+    iptables -S $CHAIN 2>/dev/null | grep -q -- '-j DROP' && iptables -F $CHAIN
+    iptables -S $DNS_CHAIN 2>/dev/null | grep -q -- '-j DROP' && iptables -F $DNS_CHAIN
+    exit 0
+  " >/dev/null 2>&1
+}
+
+# Always-on guardrails, reapplied idempotently on every enforce:
+#
+#   * IPv6 is dropped outright for the guest. There is no global v6 address on
+#     this bridge today, so nothing legitimate is lost -- but if Docker or the
+#     host ever gains v6, the v4 rules above would silently stop being the
+#     whole story. Cheaper to close now than to notice later.
+#
+#   * LAN isolation keeps the guest off your homelab and tailnet even when it
+#     is allowed onto the internet.
+#
+# Both are written to leave inbound-initiated flows alone via --ctdir REPLY, so
+# RDP and the noVNC console keep working exactly as before.
+apply_guards() {
+  local lan=$2
+  docker exec "$1" sh -c "
+    ip6tables -N $LAN_CHAIN 2>/dev/null
+    ip6tables -C FORWARD -j $LAN_CHAIN 2>/dev/null || ip6tables -I FORWARD 1 -j $LAN_CHAIN
+    if ! ip6tables -C $LAN_CHAIN -i $GUEST_IF ! -o $GUEST_IF -j DROP 2>/dev/null; then
+      ip6tables -F $LAN_CHAIN
+      ip6tables -A $LAN_CHAIN -i $GUEST_IF ! -o $GUEST_IF -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+      ip6tables -A $LAN_CHAIN -i $GUEST_IF ! -o $GUEST_IF -j DROP
+    fi
+
+    iptables -N $LAN_CHAIN 2>/dev/null
+    iptables -C FORWARD -j $LAN_CHAIN 2>/dev/null || iptables -I FORWARD 1 -j $LAN_CHAIN
+
+    if [ '$lan' = 'on' ]; then
+      if ! iptables -C $LAN_CHAIN -i $GUEST_IF ! -o $GUEST_IF -d 192.168.0.0/16 -j DROP 2>/dev/null; then
+        iptables -F $LAN_CHAIN
+        iptables -A $LAN_CHAIN -i $GUEST_IF ! -o $GUEST_IF -m conntrack --ctstate ESTABLISHED,RELATED --ctdir REPLY -j RETURN
+        for net in $PRIVATE_RANGES; do
+          iptables -A $LAN_CHAIN -i $GUEST_IF ! -o $GUEST_IF -d \$net -j DROP
+        done
+      fi
+    else
+      iptables -S $LAN_CHAIN 2>/dev/null | grep -q -- '-j DROP' && iptables -F $LAN_CHAIN
+    fi
+    exit 0
+  " >/dev/null 2>&1
+}
+
+# Resolve user intent + VPN policy into what the rules should actually be, and
+# nudge IVPN towards the state the policy needs.
+# Echoes "<effective> <reason> <vpnstate> <firewallstate>".
+effective_state() {
+  local want policy vpn fw running
+
+  want=$(desired_state)
+  policy=$(require_vpn)
+
+  if [[ $want == "blocked" ]]; then
+    echo "blocked user UNKNOWN UNKNOWN"
+    return
+  fi
+
+  if [[ $policy != "on" ]]; then
+    echo "allowed user UNKNOWN UNKNOWN"
+    return
+  fi
+
+  running=$(running_containers)
+  if [[ -z $running ]]; then
+    # Nothing to protect, and nothing that justifies dialling the tunnel up.
+    echo "allowed user UNKNOWN UNKNOWN"
+    return
+  fi
+
+  read -r vpn fw < <(vpn_probe)
+
+  if [[ $vpn != "CONNECTED" ]]; then
+    throttled_ivpn connect ivpn connect -fastest
+    echo "blocked vpn $vpn $fw"
+    return
+  fi
+
+  # Only now is arming the firewall safe -- see the header note.
+  if [[ $fw != "ENABLED" ]]; then
+    throttled_ivpn firewall ivpn firewall -on
+    echo "blocked firewall $vpn $fw"
+    return
+  fi
+
+  echo "allowed user $vpn $fw"
+}
+
+# ------------------------------------------------------------- commands ----
+
+cmd_enforce() {
+  local eff lan c rc=0
+  eff=$(effective_state | cut -d' ' -f1)
+  lan=$(lan_policy)
+  for c in $(running_containers); do
+    # Guards first: if this is a freshly recreated container, the isolation
+    # rules should land before anything relaxes the internet cut.
+    apply_guards "$c" "$lan" || rc=1
+    if [[ $eff == "blocked" ]]; then
+      apply_block "$c" || rc=1
+    else
+      clear_block "$c" || rc=1
+    fi
+  done
+  return $rc
+}
+
+cmd_on() {
+  set_desired_state blocked
+  cmd_enforce
+}
+
+cmd_off() {
+  set_desired_state allowed
+  cmd_enforce
+}
+
+cmd_toggle() {
+  [[ $(desired_state) == "blocked" ]] && cmd_off || cmd_on
+}
+
+# What the bar widget calls on every poll: decide once, apply, then report --
+# so a tick costs a single `ivpn status` rather than one per sub-command. This
+# is also what makes the widget self-healing: a container recreated by
+# windows-vm-launch gets its rules back on the next tick without being asked.
+cmd_sync() {
+  local eff reason vpn fw lan c
+  read -r eff reason vpn fw < <(effective_state)
+  lan=$(lan_policy)
+  for c in $(running_containers); do
+    apply_guards "$c" "$lan"
+    [[ $eff == "blocked" ]] && apply_block "$c" || clear_block "$c"
+  done
+  cmd_status_json "$eff" "$reason" "$vpn" "$fw"
+}
+
+cmd_lan() {
+  case "${1:-}" in
+    on) set_lan_policy on ;;
+    off) set_lan_policy off ;;
+    toggle) [[ $(lan_policy) == "on" ]] && set_lan_policy off || set_lan_policy on ;;
+    *) die "usage: vmkill lan on|off|toggle" ;;
+  esac
+  cmd_enforce
+}
+
+cmd_vpn() {
+  case "${1:-}" in
+    on) set_require_vpn on ;;
+    off) set_require_vpn off ;;
+    toggle) [[ $(require_vpn) == "on" ]] && set_require_vpn off || set_require_vpn on ;;
+    *) die "usage: vmkill vpn on|off|toggle" ;;
+  esac
+  cmd_enforce
+}
+
+cmd_status_json() {
+  local eff reason vpn fw c listing running blocked drops first=1
+  if [[ -n ${1:-} ]]; then
+    eff=$1 reason=$2 vpn=$3 fw=$4
+  else
+    read -r eff reason vpn fw < <(effective_state)
+  fi
+
+  printf '{"desired":"%s","effective":"%s","reason":"%s","requireVpn":%s,"lanBlocked":%s,"vpn":"%s","firewall":"%s","vms":[' \
+    "$(desired_state)" "$eff" "$reason" \
+    "$([[ $(require_vpn) == "on" ]] && echo true || echo false)" \
+    "$([[ $(lan_policy) == "on" ]] && echo true || echo false)" "$vpn" "$fw"
+
+  for c in $(all_containers); do
+    running=false
+    blocked=false
+    drops=0
+
+    if docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null | grep -q true; then
+      running=true
+      listing=$(chain_listing "$c")
+      # Columns under -vnxL are: pkts bytes target prot opt in out src dst
+      if grep -q '[[:space:]]DROP[[:space:]]' <<<"$listing"; then
+        blocked=true
+        drops=$(awk '$3=="DROP"{print $1; exit}' <<<"$listing")
+        [[ -n $drops ]] || drops=0
+      fi
+    fi
+
+    ((first)) || printf ','
+    first=0
+    printf '{"name":"%s","running":%s,"blocked":%s,"dropped":%s}' \
+      "$c" "$running" "$blocked" "$drops"
+  done
+  printf ']}\n'
+}
+
+cmd_status_plain() {
+  local eff reason vpn fw c listing drops held=""
+  read -r eff reason vpn fw < <(effective_state)
+
+  [[ $reason == "vpn" ]] && held="  (held: VPN is $vpn)"
+  [[ $reason == "firewall" ]] && held="  (held: IVPN firewall is $fw)"
+
+  echo "intent    : $(desired_state)"
+  echo "effective : $eff$held"
+  echo "require   : VPN $(require_vpn)   [vpn=$vpn firewall=$fw]"
+  echo "lan block : $(lan_policy)"
+  for c in $(all_containers); do
+    if ! docker inspect -f '{{.State.Running}}' "$c" 2>/dev/null | grep -q true; then
+      printf '  %-24s not running\n' "$c"
+      continue
+    fi
+    listing=$(chain_listing "$c")
+    if grep -q '[[:space:]]DROP[[:space:]]' <<<"$listing"; then
+      drops=$(awk '$3=="DROP"{print $1; exit}' <<<"$listing")
+      printf '  %-24s BLOCKED (%s packets dropped)\n' "$c" "${drops:-0}"
+    else
+      printf '  %-24s allowed\n' "$c"
+    fi
+  done
+}
+
+case "${1:-status}" in
+  on | block) cmd_on ;;
+  off | unblock | allow) cmd_off ;;
+  toggle) cmd_toggle ;;
+  enforce) cmd_enforce ;;
+  vpn) shift; cmd_vpn "$@" ;;
+  lan) shift; cmd_lan "$@" ;;
+  sync) cmd_sync ;;
+  status)
+    [[ ${2:-} == "--plain" ]] && cmd_status_plain || cmd_status_json
+    ;;
+  -h | --help | help)
+    sed -n '3,5p' "$0" | sed 's/^# \?//'
+    ;;
+  *) die "unknown command: $1 (try: on, off, toggle, enforce, sync, vpn, lan, status)" ;;
+esac
