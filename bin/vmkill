@@ -217,12 +217,18 @@ apply_block() {
     # OUTPUT traffic that never crosses FORWARD, so the cut above does not
     # touch it. Left alone, a cut VM can still spell data out one hostname at
     # a time, and still tells the upstream resolver every site it visits.
+    # Read the uplink rather than assuming eth0. It *is* eth0 today, but a
+    # hardcoded interface that stops matching does not fail loudly -- it fails
+    # open, silently reopening the side channel this chain exists to close.
+    UP=\$(ip -4 route show default 2>/dev/null | awk '{print \$5; exit}')
+    [ -z \"\$UP\" ] && UP=eth0
+
     iptables -N $DNS_CHAIN 2>/dev/null
     iptables -C OUTPUT -j $DNS_CHAIN 2>/dev/null || iptables -I OUTPUT 1 -j $DNS_CHAIN
-    if ! iptables -C $DNS_CHAIN -o eth0 -p udp --dport 53 -j DROP 2>/dev/null; then
+    if ! iptables -C $DNS_CHAIN -o \"\$UP\" -p udp --dport 53 -j DROP 2>/dev/null; then
       iptables -F $DNS_CHAIN
-      iptables -A $DNS_CHAIN -o eth0 -p udp --dport 53 -j DROP
-      iptables -A $DNS_CHAIN -o eth0 -p tcp --dport 53 -j DROP
+      iptables -A $DNS_CHAIN -o \"\$UP\" -p udp --dport 53 -j DROP
+      iptables -A $DNS_CHAIN -o \"\$UP\" -p tcp --dport 53 -j DROP
     fi
   " >/dev/null 2>&1
 }
@@ -366,7 +372,14 @@ cmd_sync() {
   lan=$(lan_policy)
   for c in $(running_containers); do
     apply_guards "$c" "$lan"
-    [[ $eff == "blocked" ]] && apply_block "$c" || clear_block "$c"
+    # if/else, not `&& apply_block || clear_block`: with the && || form a
+    # failing apply_block falls through to clear_block and *unblocks* the VM.
+    # The one path that must never fail open is the one that runs on failure.
+    if [[ $eff == "blocked" ]]; then
+      apply_block "$c"
+    else
+      clear_block "$c"
+    fi
   done
   cmd_status_json "$eff" "$reason" "$vpn" "$fw"
 }
