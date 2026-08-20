@@ -281,6 +281,20 @@ apply_guards() {
     else
       iptables -S $LAN_CHAIN 2>/dev/null | grep -q -- '-j DROP' && iptables -F $LAN_CHAIN
     fi
+
+    # MSS clamp. The guest sits on a 1500-byte network but egresses through
+    # the host's tunnel (wgivpn MTU 1420, so 1380 for TCP), and the host
+    # forwards rather than originates, so nothing sizes the connection to the
+    # tunnel. Most sites survive that via PMTUD, but Azure's front door
+    # blackholes ICMP frag-needed: TCP connects, then the TLS handshake dies
+    # on the oversized certificate packets -- Microsoft Store and Windows
+    # Update fail while google.com works. Clamping SYNs crossing FORWARD
+    # fixes both directions for the guest; OUTPUT covers the container's own
+    # egress the same way.
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || \
+      iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
+    iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380
     exit 0
   " >/dev/null 2>&1
 }
